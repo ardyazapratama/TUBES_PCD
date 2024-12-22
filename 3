@@ -1,0 +1,161 @@
+import shutil
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+
+# 2. Oversample the Minority Class
+def analyze_distribution(directory):
+    class_counts = {}
+    for class_name in os.listdir(directory):
+        class_path = os.path.join(directory, class_name)
+        if os.path.isdir(class_path):
+            class_counts[class_name] = len(os.listdir(class_path))
+    print("Class Distribution:", class_counts)
+    return class_counts
+
+def oversample_minority_class(directory, minority_class, target_count):
+    output_dir = directory + "_balanced"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for class_name in os.listdir(directory):
+        class_path = os.path.join(directory, class_name)
+        output_class_path = os.path.join(output_dir, class_name)
+        os.makedirs(output_class_path, exist_ok=True)
+        for img in os.listdir(class_path):
+            shutil.copy(os.path.join(class_path, img), output_class_path)
+        if class_name == minority_class:
+            current_count = len(os.listdir(class_path))
+            for i in range(target_count - current_count):
+                img = random.choice(os.listdir(class_path))
+                shutil.copy(os.path.join(class_path, img), os.path.join(output_class_path, f"copy_{i}_{img}"))
+    return output_dir
+
+train_distribution = analyze_distribution(train_dir)
+minority_class = min(train_distribution, key=train_distribution.get)
+majority_class = max(train_distribution, key=train_distribution.get)
+balanced_train_dir = oversample_minority_class(train_dir, minority_class, train_distribution[majority_class])
+
+# 3. Data Generators
+train_datagen = ImageDataGenerator(
+    rescale=1.0 / 255,
+    rotation_range=20,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True
+)
+val_test_datagen = ImageDataGenerator(rescale=1.0 / 255)
+
+train_generator = train_datagen.flow_from_directory(
+    balanced_train_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='binary'
+)
+val_generator = val_test_datagen.flow_from_directory(
+    val_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='binary'
+)
+test_generator = val_test_datagen.flow_from_directory(
+    test_dir,
+    target_size=(224, 224),
+    batch_size=32,
+    class_mode='binary',
+    shuffle=False
+)
+
+# 4. Load DenseNet and Build Model
+base_model = DenseNet121(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+for layer in base_model.layers[:-20]:  # Freeze the first N layers
+    layer.trainable = False
+
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(256, activation='relu')(x)
+x = Dropout(0.5)(x)
+predictions = Dense(1, activation='sigmoid')(x)
+
+model = Model(inputs=base_model.input, outputs=predictions)
+model.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy', metrics=['accuracy'])
+
+# Define EarlyStopping callback
+early_stopping = EarlyStopping(
+    monitor='val_loss',  # Metric to monitor
+    patience=5,          # Number of epochs with no improvement to wait before stopping
+    restore_best_weights=True,  # Restore weights from the epoch with the best value of the monitored metric
+    verbose=1
+)
+
+# 5. Train the Model
+history = model.fit(train_generator, epochs=20, validation_data=val_generator,callbacks=[early_stopping])
+
+# 6. Evaluate and Analyze
+test_loss, test_acc = model.evaluate(test_generator)
+y_true = test_generator.classes
+y_pred = (model.predict(test_generator) > 0.5).astype("int32").flatten()
+
+tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+accuracy = (tp + tn) / (tp + tn + fp + fn)
+f1_score = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+
+print("\nAdditional Metrics:")
+print(f"Sensitivity (Recall): {sensitivity:.2f}")
+print(f"Specificity: {specificity:.2f}")
+print(f"Precision: {precision:.2f}")
+print(f"Negative Predictive Value (NPV): {npv:.2f}")
+print(f"Accuracy: {accuracy:.2f}")
+print(f"F1 Score: {f1_score:.2f}")
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_true, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=['Non-TB', 'TB']))
+# Get a batch of test images and their true labels
+test_images, test_labels = next(test_generator)
+predictions = model.predict(test_images)
+predicted_labels = (predictions > 0.5).astype("int32").flatten()
+
+# Visualize Training History
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+plt.legend()
+plt.title('Accuracy')
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.legend()
+plt.title('Loss')
+# Plot a random selection of 10 test images with their true and predicted labels
+plt.figure(figsize=(15, 10))
+for i in range(10):
+    idx = random.randint(0, len(test_images) - 1)
+    image = test_images[idx]
+    true_label = "TB" if test_labels[idx] == 1 else "Non-TB"
+    predicted_label = "TB" if predicted_labels[idx] == 1 else "Non-TB"
+
+    plt.subplot(2, 5, i + 1)
+    plt.imshow(image)
+    plt.title(f"True: {true_label}\nPred: {predicted_label}", fontsize=10)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
